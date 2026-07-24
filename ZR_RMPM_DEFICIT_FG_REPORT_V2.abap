@@ -8,8 +8,8 @@
 *&     suppressed just because no deficit exists.
 *&   - New selection-screen processing mode (radio buttons):
 *&       FG Deficit (default)  -> FG-level output only, no BOM explosion
-*&       BOM Component Details -> full FG + RM/PM component output, with
-*&       BOM explosion for ALL FGs (not only deficit ones).
+*&       BOM Component Details -> full FG + RM/PM component output; the
+*&       BOM is exploded ONLY for FGs with a negative deficit.
 *& Module      : PP
 *& Object Type : Report (ALV)
 *& Source      : Functional Specification "WRICEF-ID 7 Report for RM PM
@@ -30,13 +30,11 @@
 *&   - FG Deficit (default): run only the FG-level stages and display
 *&     every FG (deficit AND surplus) with its FG stock, open sales
 *&     order, open STO and Deficit/Surplus. No BOM explosion.
-*&   - BOM Component Details: full logic. FG data is always shown, and
-*&     the BOM is exploded for ALL selected FGs (not only deficit ones);
-*&     an FG that yields no component still appears as an FG-only row.
-*& FS-OPEN: the FS bases the RM/PM requirement on the FG deficit qty.
-*& Per the enhancement request, surplus FGs are also exploded, using
-*& abs( Deficit/Surplus ) as the explosion base qty - confirm with
-*& functional whether surplus FGs should be exploded at all.
+*&   - BOM Component Details: full logic. FG data is always shown, but
+*&     the BOM is exploded ONLY for FGs whose Deficit/Surplus is
+*&     negative (an actual shortage), per the FS. Surplus / zero-deficit
+*&     FGs still appear as FG-only rows (component columns blank), so no
+*&     FG is suppressed. Explosion base qty = abs( deficit ) = shortage.
 *&
 *& For every field the underlying source table/CDS view and filter are
 *& taken verbatim from the "Detailed FS" sheet. Points the FS left
@@ -231,8 +229,8 @@ START-OF-SELECTION.
   PERFORM calc_fg_deficit.           "Deficit/Surplus (all FGs)
 
   IF p_bomcd = abap_true.
-    " ---- BOM Component Details mode: explode ALL FGs, enrich RM/PM --
-    PERFORM explode_all_boms.        "Stage F (all FGs, not only deficit)
+    " ---- BOM Component Details mode: explode deficit FGs, enrich RM/PM
+    PERFORM explode_deficit_boms.    "Stage F (only FGs with negative deficit)
     PERFORM build_and_enrich_output. "Stage G (+ FG-only rows if no comp)
   ELSE.
     " ---- FG Deficit mode: FG-level output only, no BOM explosion ----
@@ -777,36 +775,34 @@ FORM calc_fg_deficit.
 ENDFORM.
 
 *&---------------------------------------------------------------------*
-*&      Form  EXPLODE_ALL_BOMS
+*&      Form  EXPLODE_DEFICIT_BOMS
 *&---------------------------------------------------------------------*
 * BOM Component Details mode: explode the 1st level of the active BOM,
-* one BOM at a time, for ALL selected FGs (deficit AND surplus) - not
-* only deficit FGs. The active alternative is resolved in bulk; the
+* one BOM at a time, ONLY for FGs whose Deficit/Surplus is negative
+* (i.e. an actual shortage), per the FS. Surplus / zero-deficit FGs are
+* NOT exploded; they still appear as FG-only rows via
+* BUILD_AND_ENRICH_OUTPUT, so FG data is never suppressed.
+* The active alternative is resolved in bulk (deficit FGs only); the
 * level-1 explosion itself is per FG via CS_BOM_EXPL_MAT_V2 (RCS11001's
 * FM), as the FS requires per-material explosion. The loop issues no
-* SELECT. FGs whose Deficit/Surplus is exactly zero (nothing to size an
-* explosion on) or that have no active BOM are skipped here; they are
-* still shown as FG-only rows by BUILD_AND_ENRICH_OUTPUT.
-* FS-OPEN: explosion base = abs( deficit_fg ); confirm surplus handling.
+* SELECT. FGs with no active BOM are skipped (FG-only row later).
+* Explosion base qty = abs( deficit_fg ) = the shortage quantity.
 *&---------------------------------------------------------------------*
-FORM explode_all_boms.
+FORM explode_deficit_boms.
 
   DATA lt_alt TYPE tt_bom_alt.
 
-  DATA(lt_fg_keys) = VALUE tt_key( ).
-  LOOP AT gt_fg INTO DATA(ls_fg).
-    INSERT VALUE #( matnr = ls_fg-matnr werks = ls_fg-werks ) INTO TABLE lt_fg_keys.
+  DATA(lt_def_keys) = VALUE tt_key( ).
+  LOOP AT gt_fg INTO DATA(ls_fg) WHERE deficit_fg < 0.
+    INSERT VALUE #( matnr = ls_fg-matnr werks = ls_fg-werks ) INTO TABLE lt_def_keys.
   ENDLOOP.
-  IF lt_fg_keys IS INITIAL.
+  IF lt_def_keys IS INITIAL.
     RETURN.
   ENDIF.
 
-  PERFORM get_active_bom_alt USING lt_fg_keys CHANGING lt_alt.
+  PERFORM get_active_bom_alt USING lt_def_keys CHANGING lt_alt.
 
-  LOOP AT gt_fg INTO ls_fg.
-    IF ls_fg-deficit_fg = 0.
-      CONTINUE.                          "no qty to explode -> FG-only row later
-    ENDIF.
+  LOOP AT gt_fg INTO ls_fg WHERE deficit_fg < 0.
     READ TABLE lt_alt INTO DATA(ls_alt)
       WITH TABLE KEY matnr = ls_fg-matnr werks = ls_fg-werks.
     IF sy-subrc <> 0.
