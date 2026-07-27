@@ -72,10 +72,17 @@ TYPES: BEGIN OF ty_key,
        END OF ty_key,
        tt_key TYPE SORTED TABLE OF ty_key WITH UNIQUE KEY matnr werks.
 
+* MENGE stays the combined Unrestricted + Quality total (what the FG
+* deficit formula and the RM/PM component stock have always used).
+* UNRES / QUAL carry the same figures split out, so the FG Deficit ALV
+* can show them separately without a second read of NSDM_V_MCHB /
+* NSDM_V_MARD - both are filled from the one existing SELECT pass.
 TYPES: BEGIN OF ty_qty,
          matnr TYPE matnr,
          werks TYPE werks_d,
-         menge TYPE menge_d,
+         menge TYPE menge_d,        "Unrestricted + Quality (total)
+         unres TYPE menge_d,        "Unrestricted only
+         qual  TYPE menge_d,        "Quality only
        END OF ty_qty,
        tt_qty TYPE SORTED TABLE OF ty_qty WITH UNIQUE KEY matnr werks.
 
@@ -125,12 +132,22 @@ TYPES: BEGIN OF ty_so_item,
        tt_so_item TYPE STANDARD TABLE OF ty_so_item WITH EMPTY KEY.
 
 * FG-level result
+* FG_UNRES / FG_QUAL / FG_NETWT / FG_ARBPL / FG_PRT are FG-level
+* attributes of the Finished Good itself (its own master data and its
+* own 1st routing), added for the FG Deficit ALV. They are populated
+* from data the report already reads - see FILL_FG_STOCK and
+* FILL_FG_EXTRA_DATA.
 TYPES: BEGIN OF ty_fg,
          matnr      TYPE matnr,
          werks      TYPE werks_d,
          maktx      TYPE maktx,
          matkl      TYPE matkl,
          matcat     TYPE bezei20,
+         fg_unres   TYPE menge_d,     "Unrestricted stock (FG)
+         fg_qual    TYPE menge_d,     "Quality stock (FG)
+         fg_netwt   TYPE ntgew,       "Net weight (FG)
+         fg_arbpl   TYPE arbpl,       "Work Center (FG routing)
+         fg_prt     TYPE equnr,       "PRT (FG routing)
          fg_stock   TYPE menge_d,
          tot_so     TYPE menge_d,
          net_sto    TYPE menge_d,
@@ -147,12 +164,26 @@ TYPES: BEGIN OF ty_comp,
        tt_comp TYPE STANDARD TABLE OF ty_comp WITH EMPTY KEY.
 
 * Final ALV row (BRD "ALV generation format" order)
+* The FG_* block below is displayed ONLY in FG Deficit mode and is
+* hidden in BOM Component Details mode (see HIDE_FG_ONLY_COLUMNS), so
+* the BOM Component Details ALV keeps exactly the columns, order and
+* values it had before. Conversely the component block (IDNRK..EQUNR)
+* is hidden in FG Deficit mode, as before.
+* NOTE: FG_NETWT / FG_ARBPL / FG_PRT are deliberately separate fields
+* from the component-level NET_WEIGHT / ARBPL / EQUNR further down -
+* in BOM mode those describe the component/its FG routing and must not
+* be disturbed.
 TYPES: BEGIN OF ty_out,
          matnr        TYPE matnr,
          maktx        TYPE maktx,
          matkl        TYPE matkl,
          matcat       TYPE bezei20,
          werks        TYPE werks_d,
+         fg_unres     TYPE menge_d,   "FG mode only
+         fg_qual      TYPE menge_d,   "FG mode only
+         fg_netwt     TYPE ntgew,     "FG mode only
+         fg_arbpl     TYPE arbpl,     "FG mode only
+         fg_prt       TYPE equnr,     "FG mode only
          fg_stock     TYPE menge_d,
          tot_so       TYPE menge_d,
          net_sto      TYPE menge_d,
@@ -234,6 +265,7 @@ START-OF-SELECTION.
     PERFORM build_and_enrich_output. "Stage G (+ FG-only rows if no comp)
   ELSE.
     " ---- FG Deficit mode: FG-level output only, no BOM explosion ----
+    PERFORM fill_fg_extra_data.      "FG Net Weight / Work Center / PRT
     PERFORM build_fg_output.
   ENDIF.
 
@@ -422,8 +454,64 @@ FORM fill_fg_stock.
     READ TABLE lt_stock INTO DATA(ls_stock)
       WITH TABLE KEY matnr = <fg>-matnr werks = <fg>-werks.
     IF sy-subrc = 0.
-      <fg>-fg_stock = ls_stock-menge.
+      <fg>-fg_stock = ls_stock-menge.     "Unrestricted + Quality (unchanged)
+      <fg>-fg_unres = ls_stock-unres.     "same read, split out for the ALV
+      <fg>-fg_qual  = ls_stock-qual.
     ENDIF.
+  ENDLOOP.
+
+ENDFORM.
+
+*&---------------------------------------------------------------------*
+*&      Form  FILL_FG_EXTRA_DATA
+*&---------------------------------------------------------------------*
+* FG Deficit mode only: Net Weight, Work Center and PRT of the Finished
+* Good itself. Reuses the existing bulk routines GET_NET_WEIGHT and
+* GET_WORKCENTER_PRT (the same ones the component stage uses) - passing
+* the FG keys instead of component keys - so no new database logic and
+* no SELECT inside a loop is introduced.
+* Called only when P_FGDEF is set: in BOM Component Details mode these
+* columns are hidden, so fetching them there would be a redundant read.
+*&---------------------------------------------------------------------*
+FORM fill_fg_extra_data.
+
+  DATA: lt_weight TYPE tt_weight,
+        lt_wc     TYPE tt_wc,
+        lt_prt    TYPE tt_prt.
+
+  IF gt_fg IS INITIAL.
+    RETURN.
+  ENDIF.
+
+  DATA(lt_keys) = VALUE tt_key( ).
+  LOOP AT gt_fg INTO DATA(ls_fg).
+    INSERT VALUE #( matnr = ls_fg-matnr werks = ls_fg-werks ) INTO TABLE lt_keys.
+  ENDLOOP.
+
+  PERFORM get_net_weight     USING lt_keys CHANGING lt_weight.
+  PERFORM get_workcenter_prt USING lt_keys CHANGING lt_wc lt_prt.
+
+  " In-memory assignment only - no database access in this loop.
+  LOOP AT gt_fg ASSIGNING FIELD-SYMBOL(<fg>).
+
+    READ TABLE lt_weight INTO DATA(ls_w)
+      WITH TABLE KEY matnr = <fg>-matnr.
+    IF sy-subrc = 0.
+      <fg>-fg_netwt = ls_w-net_weight.
+    ENDIF.
+
+    READ TABLE lt_wc INTO DATA(ls_wc)
+      WITH TABLE KEY matnr = <fg>-matnr werks = <fg>-werks.
+    IF sy-subrc = 0.
+      <fg>-fg_arbpl = ls_wc-arbpl.
+    ENDIF.
+
+    READ TABLE lt_prt INTO DATA(ls_prt)
+      WITH TABLE KEY matnr = <fg>-matnr werks = <fg>-werks.
+    IF sy-subrc = 0.
+      <fg>-fg_prt = ls_prt-equnr.
+    ENDIF.
+
   ENDLOOP.
 
 ENDFORM.
@@ -510,9 +598,10 @@ FORM get_total_stock USING    it_keys TYPE tt_key
       IF sy-subrc = 0.
         CONTINUE.                       "excluded storage location
       ENDIF.
-      DATA(lv_qty_mchb) = CONV menge_d( ls_mchb-clabs + ls_mchb-cinsm ).
-      PERFORM add_qty USING ls_mchb-matnr ls_mchb-werks lv_qty_mchb
-                      CHANGING ct_qty.
+      PERFORM add_stock_qty USING ls_mchb-matnr ls_mchb-werks
+                                  CONV menge_d( ls_mchb-clabs )   "Unrestricted
+                                  CONV menge_d( ls_mchb-cinsm )   "Quality
+                            CHANGING ct_qty.
     ENDLOOP.
   ENDIF.
 
@@ -532,9 +621,10 @@ FORM get_total_stock USING    it_keys TYPE tt_key
       IF sy-subrc = 0.
         CONTINUE.
       ENDIF.
-      DATA(lv_qty_mard) = CONV menge_d( ls_mard-labst + ls_mard-insme ).
-      PERFORM add_qty USING ls_mard-matnr ls_mard-werks lv_qty_mard
-                      CHANGING ct_qty.
+      PERFORM add_stock_qty USING ls_mard-matnr ls_mard-werks
+                                  CONV menge_d( ls_mard-labst )   "Unrestricted
+                                  CONV menge_d( ls_mard-insme )   "Quality
+                            CHANGING ct_qty.
     ENDLOOP.
   ENDIF.
 
@@ -542,6 +632,9 @@ ENDFORM.
 
 *&---------------------------------------------------------------------*
 *&      Form  ADD_QTY  (accumulate qty per Material/Plant)
+*&---------------------------------------------------------------------*
+* Generic accumulator - unchanged. Used by the Total Sales Order and
+* Net Total STO stages, which carry a single quantity per key.
 *&---------------------------------------------------------------------*
 FORM add_qty USING    iv_matnr TYPE matnr
                       iv_werks TYPE werks_d
@@ -554,6 +647,39 @@ FORM add_qty USING    iv_matnr TYPE matnr
     <q>-menge = <q>-menge + iv_qty.
   ELSE.
     INSERT VALUE #( matnr = iv_matnr werks = iv_werks menge = iv_qty )
+      INTO TABLE ct_qty.
+  ENDIF.
+
+ENDFORM.
+
+*&---------------------------------------------------------------------*
+*&      Form  ADD_STOCK_QTY  (accumulate stock per Material/Plant)
+*&---------------------------------------------------------------------*
+* Stock-specific accumulator used only by GET_TOTAL_STOCK. Keeps
+* Unrestricted and Quality separately AND as a combined total, so the
+* FG Deficit ALV can show the split without any extra database access.
+* MENGE keeps its previous meaning (Unrestricted + Quality) - which is
+* what the FG deficit formula and the RM/PM component stock consume -
+* so both remain unchanged.
+*&---------------------------------------------------------------------*
+FORM add_stock_qty USING    iv_matnr TYPE matnr
+                            iv_werks TYPE werks_d
+                            iv_unres TYPE menge_d
+                            iv_qual  TYPE menge_d
+                   CHANGING ct_qty   TYPE tt_qty.
+
+  READ TABLE ct_qty ASSIGNING FIELD-SYMBOL(<q>)
+    WITH TABLE KEY matnr = iv_matnr werks = iv_werks.
+  IF sy-subrc = 0.
+    <q>-unres = <q>-unres + iv_unres.
+    <q>-qual  = <q>-qual  + iv_qual.
+    <q>-menge = <q>-menge + iv_unres + iv_qual.
+  ELSE.
+    INSERT VALUE #( matnr = iv_matnr
+                    werks = iv_werks
+                    unres = iv_unres
+                    qual  = iv_qual
+                    menge = iv_unres + iv_qual )
       INTO TABLE ct_qty.
   ENDIF.
 
@@ -1067,6 +1193,15 @@ FORM move_fg_to_out USING    iu_fg  TYPE ty_fg
   cs_out-net_sto    = iu_fg-net_sto.
   cs_out-deficit_fg = iu_fg-deficit_fg.
 
+  " FG-only columns. In BOM Component Details mode FILL_FG_EXTRA_DATA is
+  " not run, so FG_NETWT/FG_ARBPL/FG_PRT stay initial and the columns are
+  " hidden anyway - the BOM ALV is unaffected either way.
+  cs_out-fg_unres   = iu_fg-fg_unres.
+  cs_out-fg_qual    = iu_fg-fg_qual.
+  cs_out-fg_netwt   = iu_fg-fg_netwt.
+  cs_out-fg_arbpl   = iu_fg-fg_arbpl.
+  cs_out-fg_prt     = iu_fg-fg_prt.
+
 ENDFORM.
 
 *&---------------------------------------------------------------------*
@@ -1290,31 +1425,87 @@ FORM display_alv.
   DATA(lo_cols) = lo_alv->get_columns( ).
   lo_cols->set_optimize( abap_true ).
 
-  PERFORM set_col USING lo_cols 'MATNR'        'Material'.
-  PERFORM set_col USING lo_cols 'MAKTX'        'Material Description'.
-  PERFORM set_col USING lo_cols 'MATKL'        'Material Group'.
-  PERFORM set_col USING lo_cols 'MATCAT'       'Material Category'.
-  PERFORM set_col USING lo_cols 'WERKS'        'Plant'.
-  PERFORM set_col USING lo_cols 'FG_STOCK'     'FG Stock'.
-  PERFORM set_col USING lo_cols 'TOT_SO'       'Total Sales Order'.
-  PERFORM set_col USING lo_cols 'NET_STO'      'Net Total STO'.
-  PERFORM set_col USING lo_cols 'DEFICIT_FG'   'Deficit/Surplus FG'.
-  PERFORM set_col USING lo_cols 'IDNRK'        'BOM Component'.
-  PERFORM set_col USING lo_cols 'QTY_BOM'      'QTY as per BOM'.
-  PERFORM set_col USING lo_cols 'RMPM_STOCK'   'RM/PM Stock'.
-  PERFORM set_col USING lo_cols 'RMPM_DEFICIT' 'RM/PM Deficit'.
-  PERFORM set_col USING lo_cols 'MIN_STOCK'    'Min Stock Level'.
-  PERFORM set_col USING lo_cols 'MAX_STOCK'    'Max Stock Level'.
-  PERFORM set_col USING lo_cols 'NET_WEIGHT'   'Net Weight'.
-  PERFORM set_col USING lo_cols 'ARBPL'        'Work Center'.
-  PERFORM set_col USING lo_cols 'EQUNR'        'PRT'.
+  " ---- Shared FG-level columns ------------------------------------
+  " A SHORT text is supplied for every quantity column. Without one,
+  " SET_OPTIMIZE lets SALV fall back to the data element's own short
+  " text - for MENGE_D that is the generic "Quantity", which is why
+  " Open SO / Open STO / Deficit all used to render with the same
+  " header. Short is capped at 10 characters by SCRTEXT_S.
+  PERFORM set_col USING lo_cols 'MATNR'  'Material'   'Material'             'Material'.
+  PERFORM set_col USING lo_cols 'MAKTX'  'Descr.'     'Material Description' 'Material Description'.
+  PERFORM set_col USING lo_cols 'MATKL'  'Matl Group' 'Material Group'       'Material Group'.
+  PERFORM set_col USING lo_cols 'MATCAT' 'Matl Cat.'  'Material Category'    'Material Category'.
+  PERFORM set_col USING lo_cols 'WERKS'  'Plant'      'Plant'                'Plant'.
 
-  " FG Deficit mode: show FG-level columns only.
+  PERFORM set_col USING lo_cols 'FG_STOCK'
+                        'FG Stock' 'FG Stock' 'FG Stock (Unrestricted + Quality)'.
+
+  " Renamed per change request: each quantity now has a unique,
+  " meaningful header. Field names and business logic are untouched -
+  " this only affects the displayed text.
+  PERFORM set_col USING lo_cols 'TOT_SO'
+                        'OpenSOQty' 'Open Sales Order Qty' 'Open Sales Order Qty'.
+  PERFORM set_col USING lo_cols 'NET_STO'
+                        'OpenSTOQty' 'Open STO Qty' 'Open STO Qty'.
+  PERFORM set_col USING lo_cols 'DEFICIT_FG'
+                        'FGDef/Sur' 'FG Def/Surplus Qty' 'FG Deficit / Surplus Qty'.
+
+  " ---- FG-only columns (FG Deficit mode) --------------------------
+  PERFORM set_col USING lo_cols 'FG_UNRES'
+                        'Unrest.Stk' 'Unrestricted Stock' 'Unrestricted Stock'.
+  PERFORM set_col USING lo_cols 'FG_QUAL'
+                        'Qual.Stock' 'Quality Stock' 'Quality Stock'.
+  PERFORM set_col USING lo_cols 'FG_NETWT'
+                        'Net Weight' 'Net Weight' 'Net Weight'.
+  PERFORM set_col USING lo_cols 'FG_ARBPL'
+                        'Work Ctr.' 'Work Center' 'Work Center'.
+  PERFORM set_col USING lo_cols 'FG_PRT'
+                        'PRT' 'PRT' 'PRT'.
+
+  " ---- Component columns (BOM Component Details mode) -------------
+  " Headers deliberately unchanged; SPACE as short text keeps the
+  " previous behaviour for this ALV exactly as it was.
+  PERFORM set_col USING lo_cols 'IDNRK'        space 'BOM Component'  'BOM Component'.
+  PERFORM set_col USING lo_cols 'QTY_BOM'      space 'QTY as per BOM' 'QTY as per BOM'.
+  PERFORM set_col USING lo_cols 'RMPM_STOCK'   space 'RM/PM Stock'    'RM/PM Stock'.
+  PERFORM set_col USING lo_cols 'RMPM_DEFICIT' space 'RM/PM Deficit'  'RM/PM Deficit'.
+  PERFORM set_col USING lo_cols 'MIN_STOCK'    space 'Min Stock Level' 'Min Stock Level'.
+  PERFORM set_col USING lo_cols 'MAX_STOCK'    space 'Max Stock Level' 'Max Stock Level'.
+  PERFORM set_col USING lo_cols 'NET_WEIGHT'   space 'Net Weight'     'Net Weight'.
+  PERFORM set_col USING lo_cols 'ARBPL'        space 'Work Center'    'Work Center'.
+  PERFORM set_col USING lo_cols 'EQUNR'        space 'PRT'            'PRT'.
+
   IF p_fgdef = abap_true.
+    " FG Deficit mode: FG-level columns only.
     PERFORM hide_component_columns USING lo_cols.
+  ELSE.
+    " BOM Component Details mode: hide the FG-only additions so this
+    " ALV keeps exactly the columns it had before this enhancement.
+    PERFORM hide_fg_only_columns USING lo_cols.
   ENDIF.
 
   lo_alv->display( ).
+
+ENDFORM.
+
+*&---------------------------------------------------------------------*
+*&      Form  HIDE_FG_ONLY_COLUMNS
+*&---------------------------------------------------------------------*
+* BOM Component Details mode: hide the columns that were added for the
+* FG Deficit ALV, so that output is unchanged by this enhancement.
+*&---------------------------------------------------------------------*
+FORM hide_fg_only_columns USING io_cols TYPE REF TO cl_salv_columns_table.
+
+  DATA(lt_hide) = VALUE string_table(
+    ( `FG_UNRES` ) ( `FG_QUAL` ) ( `FG_NETWT` ) ( `FG_ARBPL` ) ( `FG_PRT` ) ).
+
+  LOOP AT lt_hide INTO DATA(lv_col).
+    TRY.
+        io_cols->get_column( CONV lvc_fname( lv_col ) )->set_visible( abap_false ).
+      CATCH cx_salv_not_found.
+        "column not present - ignore
+    ENDTRY.
+  ENDLOOP.
 
 ENDFORM.
 
@@ -1343,15 +1534,31 @@ ENDFORM.
 *&---------------------------------------------------------------------*
 *&      Form  SET_COL  (set ALV column header)
 *&---------------------------------------------------------------------*
-FORM set_col USING io_cols TYPE REF TO cl_salv_columns_table
-                   iv_name TYPE csequence
-                   iv_text TYPE csequence.
+* Sets the column's display texts. Passing a SHORT text is what stops
+* SALV from falling back to the data element's own short description
+* (e.g. the generic "Quantity" that MENGE_D carries) when SET_OPTIMIZE
+* narrows a column. Pass SPACE as IV_SHORT to leave the short text
+* untouched and keep a column's previous rendering.
+* Field names and data are not affected - display text only.
+* Length limits: short 10 (SCRTEXT_S), medium 20 (SCRTEXT_M),
+* long 40 (SCRTEXT_L); longer values are truncated on assignment.
+*&---------------------------------------------------------------------*
+FORM set_col USING io_cols  TYPE REF TO cl_salv_columns_table
+                   iv_name  TYPE csequence
+                   iv_short TYPE csequence
+                   iv_med   TYPE csequence
+                   iv_long  TYPE csequence.
 
   TRY.
       DATA(lo_col) = CAST cl_salv_column_table(
                        io_cols->get_column( CONV lvc_fname( iv_name ) ) ).
-      lo_col->set_medium_text( CONV #( iv_text ) ).
-      lo_col->set_long_text( CONV #( iv_text ) ).
+
+      IF iv_short IS NOT INITIAL.
+        lo_col->set_short_text( CONV #( iv_short ) ).
+      ENDIF.
+      lo_col->set_medium_text( CONV #( iv_med ) ).
+      lo_col->set_long_text( CONV #( iv_long ) ).
+
     CATCH cx_salv_not_found.
       "column not present - ignore
   ENDTRY.
