@@ -59,7 +59,17 @@ CONSTANTS:
   gc_bom_status_act  TYPE char1     VALUE '1',   "BillOfMaterialStatus
   gc_prt_objty_fh    TYPE cr_objty  VALUE 'FH',
   gc_auth_object     TYPE xuobject  VALUE 'M_MATE_WRK', "FS-OPEN: object not named in FS
-  gc_actvt_display   TYPE activ_auth VALUE '03'.
+  gc_actvt_display   TYPE activ_auth VALUE '03',
+  " Row highlighting for a negative FG Deficit/Surplus. Colour 6 is the
+  " classic COL_NEGATIVE (red); intensified, not inverted. Using the
+  " LVC_S_SCOL colour table keeps this ECC-compatible - it is the same
+  " structure the classic REUSE_ALV grid consumes.
+  " Typed as I rather than LVC_COL / LVC_INT / LVC_INV: the underlying
+  " domains of those data elements differ across releases, and a numeric
+  " literal converts cleanly into all of them on assignment.
+  gc_color_negative  TYPE i         VALUE 6,   "COL_NEGATIVE
+  gc_color_intensiv  TYPE i         VALUE 1,
+  gc_color_not_inv   TYPE i         VALUE 0.
 
 *&---------------------------------------------------------------------*
 *& Types
@@ -132,10 +142,10 @@ TYPES: BEGIN OF ty_so_item,
        tt_so_item TYPE STANDARD TABLE OF ty_so_item WITH EMPTY KEY.
 
 * FG-level result
-* FG_UNRES / FG_QUAL / FG_NETWT / FG_ARBPL / FG_PRT are FG-level
-* attributes of the Finished Good itself (its own master data and its
-* own 1st routing), added for the FG Deficit ALV. They are populated
-* from data the report already reads - see FILL_FG_STOCK and
+* FG_UNRES / FG_QUAL / FG_MIN / FG_MAX / FG_NETWT / FG_ARBPL / FG_PRT
+* are FG-level attributes of the Finished Good itself (its own master
+* data and its own 1st routing), added for the FG Deficit ALV. They are
+* populated from data the report already reads - see FILL_FG_STOCK and
 * FILL_FG_EXTRA_DATA.
 TYPES: BEGIN OF ty_fg,
          matnr      TYPE matnr,
@@ -145,6 +155,8 @@ TYPES: BEGIN OF ty_fg,
          matcat     TYPE bezei20,
          fg_unres   TYPE menge_d,     "Unrestricted stock (FG)
          fg_qual    TYPE menge_d,     "Quality stock (FG)
+         fg_min     TYPE menge_d,     "Minimum stock level (FG)
+         fg_max     TYPE menge_d,     "Maximum stock level (FG)
          fg_netwt   TYPE ntgew,       "Net weight (FG)
          fg_arbpl   TYPE arbpl,       "Work Center (FG routing)
          fg_prt     TYPE equnr,       "PRT (FG routing)
@@ -164,23 +176,36 @@ TYPES: BEGIN OF ty_comp,
        tt_comp TYPE STANDARD TABLE OF ty_comp WITH EMPTY KEY.
 
 * Final ALV row (BRD "ALV generation format" order)
-* The FG_* block below is displayed ONLY in FG Deficit mode and is
-* hidden in BOM Component Details mode (see HIDE_FG_ONLY_COLUMNS), so
-* the BOM Component Details ALV keeps exactly the columns, order and
-* values it had before. Conversely the component block (IDNRK..EQUNR)
-* is hidden in FG Deficit mode, as before.
+* Column visibility is driven per processing mode in DISPLAY_ALV:
+*   FG_UNRES / FG_QUAL  - shown in BOTH modes. In FG mode they are the
+*                         FG stock split; in BOM mode they are the "FG
+*                         Stock" half of the stock breakup.
+*   FG_MIN / FG_MAX / FG_NETWT / FG_ARBPL / FG_PRT
+*                       - FG Deficit mode only.
+*   RMPM_UNRES / RMPM_QUAL
+*                       - BOM Component Details mode only: the "BOM
+*                         Component Stock" half of the stock breakup.
+*   MIN_STOCK / MAX_STOCK / NET_WEIGHT / ARBPL / EQUNR
+*                       - component-level fields, no longer displayed in
+*                         either mode (removed from the BOM Component
+*                         Details ALV per change request). The fields are
+*                         retained in the structure so the change is a
+*                         one-line revert, but they are no longer
+*                         populated - see BUILD_AND_ENRICH_OUTPUT.
 * NOTE: FG_NETWT / FG_ARBPL / FG_PRT are deliberately separate fields
-* from the component-level NET_WEIGHT / ARBPL / EQUNR further down -
-* in BOM mode those describe the component/its FG routing and must not
-* be disturbed.
+* from the component-level NET_WEIGHT / ARBPL / EQUNR further down.
+* T_COLOR carries the row colour (see SET_ROW_COLORS). It is registered
+* via SET_COLOR_COLUMN and is therefore never rendered as a column.
 TYPES: BEGIN OF ty_out,
          matnr        TYPE matnr,
          maktx        TYPE maktx,
          matkl        TYPE matkl,
          matcat       TYPE bezei20,
          werks        TYPE werks_d,
-         fg_unres     TYPE menge_d,   "FG mode only
-         fg_qual      TYPE menge_d,   "FG mode only
+         fg_unres     TYPE menge_d,   "both modes (FG stock split)
+         fg_qual      TYPE menge_d,   "both modes (FG stock split)
+         fg_min       TYPE menge_d,   "FG mode only
+         fg_max       TYPE menge_d,   "FG mode only
          fg_netwt     TYPE ntgew,     "FG mode only
          fg_arbpl     TYPE arbpl,     "FG mode only
          fg_prt       TYPE equnr,     "FG mode only
@@ -191,12 +216,15 @@ TYPES: BEGIN OF ty_out,
          idnrk        TYPE idnrk,
          qty_bom      TYPE menge_d,
          rmpm_stock   TYPE menge_d,
+         rmpm_unres   TYPE menge_d,   "BOM mode only (component split)
+         rmpm_qual    TYPE menge_d,   "BOM mode only (component split)
          rmpm_deficit TYPE menge_d,
-         min_stock    TYPE menge_d,
-         max_stock    TYPE menge_d,
-         net_weight   TYPE ntgew,
-         arbpl        TYPE arbpl,
-         equnr        TYPE equnr,
+         min_stock    TYPE menge_d,   "retained, no longer displayed
+         max_stock    TYPE menge_d,   "retained, no longer displayed
+         net_weight   TYPE ntgew,     "retained, no longer displayed
+         arbpl        TYPE arbpl,     "retained, no longer displayed
+         equnr        TYPE equnr,     "retained, no longer displayed
+         t_color      TYPE lvc_t_scol, "row colour (not a visible column)
        END OF ty_out,
        tt_out TYPE STANDARD TABLE OF ty_out WITH EMPTY KEY.
 
@@ -265,9 +293,12 @@ START-OF-SELECTION.
     PERFORM build_and_enrich_output. "Stage G (+ FG-only rows if no comp)
   ELSE.
     " ---- FG Deficit mode: FG-level output only, no BOM explosion ----
-    PERFORM fill_fg_extra_data.      "FG Net Weight / Work Center / PRT
+    PERFORM fill_fg_extra_data.      "FG Min/Max, Net Weight, Work Center, PRT
     PERFORM build_fg_output.
   ENDIF.
+
+  " Highlight rows whose FG Deficit/Surplus is negative - both modes.
+  PERFORM set_row_colors.
 
   PERFORM display_alv.
 
@@ -465,17 +496,19 @@ ENDFORM.
 *&---------------------------------------------------------------------*
 *&      Form  FILL_FG_EXTRA_DATA
 *&---------------------------------------------------------------------*
-* FG Deficit mode only: Net Weight, Work Center and PRT of the Finished
-* Good itself. Reuses the existing bulk routines GET_NET_WEIGHT and
-* GET_WORKCENTER_PRT (the same ones the component stage uses) - passing
-* the FG keys instead of component keys - so no new database logic and
-* no SELECT inside a loop is introduced.
+* FG Deficit mode only: Min/Max stock level, Net Weight, Work Center and
+* PRT of the Finished Good itself. Reuses the existing bulk routines
+* GET_MIN_MAX_STOCK, GET_NET_WEIGHT and GET_WORKCENTER_PRT (the same
+* ones the component stage used) - passing the FG keys instead of
+* component keys - so no new database logic and no SELECT inside a loop
+* is introduced.
 * Called only when P_FGDEF is set: in BOM Component Details mode these
 * columns are hidden, so fetching them there would be a redundant read.
 *&---------------------------------------------------------------------*
 FORM fill_fg_extra_data.
 
-  DATA: lt_weight TYPE tt_weight,
+  DATA: lt_minmax TYPE tt_minmax,
+        lt_weight TYPE tt_weight,
         lt_wc     TYPE tt_wc,
         lt_prt    TYPE tt_prt.
 
@@ -488,11 +521,19 @@ FORM fill_fg_extra_data.
     INSERT VALUE #( matnr = ls_fg-matnr werks = ls_fg-werks ) INTO TABLE lt_keys.
   ENDLOOP.
 
+  PERFORM get_min_max_stock  USING lt_keys CHANGING lt_minmax.
   PERFORM get_net_weight     USING lt_keys CHANGING lt_weight.
   PERFORM get_workcenter_prt USING lt_keys CHANGING lt_wc lt_prt.
 
   " In-memory assignment only - no database access in this loop.
   LOOP AT gt_fg ASSIGNING FIELD-SYMBOL(<fg>).
+
+    READ TABLE lt_minmax INTO DATA(ls_mm)
+      WITH TABLE KEY matnr = <fg>-matnr werks = <fg>-werks.
+    IF sy-subrc = 0.
+      <fg>-fg_min = ls_mm-min_stock.
+      <fg>-fg_max = ls_mm-max_stock.
+    ENDIF.
 
     READ TABLE lt_weight INTO DATA(ls_w)
       WITH TABLE KEY matnr = <fg>-matnr.
@@ -1064,39 +1105,44 @@ ENDFORM.
 *&      Form  BUILD_AND_ENRICH_OUTPUT
 *&---------------------------------------------------------------------*
 * Stage G (BOM Component Details mode): for every exploded component,
-* add RM/PM stock, RM/PM deficit (Requirement Qty - Total Stock),
-* Min/Max levels, Net Weight, and the FG routing's Work Center / PRT.
+* add RM/PM stock (total plus its Unrestricted / Quality breakup) and
+* RM/PM deficit (Requirement Qty - Total Stock).
 * All lookups are bulked; the assembly loop performs only in-memory
 * reads. Afterwards, every FG that produced NO component (no active BOM,
 * or zero Deficit/Surplus) still gets one FG-only row, so no FG is
 * suppressed from the output.
+*
+* CHANGE: Min/Max Stock Level, Net Weight and Work Center / PRT were
+* removed from this ALV per change request. Their bulk retrievals
+* (GET_MIN_MAX_STOCK / GET_NET_WEIGHT / GET_WORKCENTER_PRT) are
+* commented out below rather than left running, so the removal also
+* eliminates the now-redundant database reads. The forms themselves are
+* unchanged and still used by FILL_FG_EXTRA_DATA for the FG Deficit ALV.
 *&---------------------------------------------------------------------*
 FORM build_and_enrich_output.
 
   DATA: lt_stock       TYPE tt_qty,
-        lt_minmax      TYPE tt_minmax,
-        lt_weight      TYPE tt_weight,
-        lt_wc          TYPE tt_wc,
-        lt_prt         TYPE tt_prt,
         lt_fg_has_comp TYPE tt_key.
+*  DATA: lt_minmax      TYPE tt_minmax,     "removed from this ALV
+*        lt_weight      TYPE tt_weight,     "removed from this ALV
+*        lt_wc          TYPE tt_wc,         "removed from this ALV
+*        lt_prt         TYPE tt_prt.        "removed from this ALV
 
   IF gt_comp IS NOT INITIAL.
 
-    " Distinct component keys (Material=IDNRK, Plant=FG plant) and
-    " distinct FG keys (for Work Center / PRT).
+    " Distinct component keys (Material=IDNRK, Plant=FG plant).
     DATA(lt_comp_keys) = VALUE tt_key( ).
-    DATA(lt_fg_keys)   = VALUE tt_key( ).
     LOOP AT gt_comp INTO DATA(ls_comp).
       INSERT VALUE #( matnr = ls_comp-idnrk werks = ls_comp-fg-werks )
         INTO TABLE lt_comp_keys.
-      INSERT VALUE #( matnr = ls_comp-fg-matnr werks = ls_comp-fg-werks )
-        INTO TABLE lt_fg_keys.
     ENDLOOP.
 
+    " One stock read serves the total AND the Unrestricted / Quality
+    " breakup - GET_TOTAL_STOCK already returns all three (TY_QTY).
     PERFORM get_total_stock    USING lt_comp_keys CHANGING lt_stock.
-    PERFORM get_min_max_stock  USING lt_comp_keys CHANGING lt_minmax.
-    PERFORM get_net_weight     USING lt_comp_keys CHANGING lt_weight.
-    PERFORM get_workcenter_prt USING lt_fg_keys   CHANGING lt_wc lt_prt.
+*    PERFORM get_min_max_stock  USING lt_comp_keys CHANGING lt_minmax.
+*    PERFORM get_net_weight     USING lt_comp_keys CHANGING lt_weight.
+*    PERFORM get_workcenter_prt USING lt_fg_keys   CHANGING lt_wc lt_prt.
 
     LOOP AT gt_comp INTO ls_comp.
 
@@ -1108,39 +1154,45 @@ FORM build_and_enrich_output.
       <out>-idnrk   = ls_comp-idnrk.
       <out>-qty_bom = ls_comp-qty_bom.
 
+      " Component stock: total plus its Unrestricted / Quality breakup.
+      " All three come from the same TY_QTY row - no extra read.
       READ TABLE lt_stock INTO DATA(ls_stock)
         WITH TABLE KEY matnr = ls_comp-idnrk werks = ls_comp-fg-werks.
       IF sy-subrc = 0.
         <out>-rmpm_stock = ls_stock-menge.
+        <out>-rmpm_unres = ls_stock-unres.
+        <out>-rmpm_qual  = ls_stock-qual.
       ENDIF.
 
       " RM/PM Deficit = Requirement Qty (QTY as per BOM) - Total Stock
       <out>-rmpm_deficit = ls_comp-qty_bom - <out>-rmpm_stock.
 
-      READ TABLE lt_minmax INTO DATA(ls_mm)
-        WITH TABLE KEY matnr = ls_comp-idnrk werks = ls_comp-fg-werks.
-      IF sy-subrc = 0.
-        <out>-min_stock = ls_mm-min_stock.
-        <out>-max_stock = ls_mm-max_stock.
-      ENDIF.
-
-      READ TABLE lt_weight INTO DATA(ls_w)
-        WITH TABLE KEY matnr = ls_comp-idnrk.
-      IF sy-subrc = 0.
-        <out>-net_weight = ls_w-net_weight.
-      ENDIF.
-
-      READ TABLE lt_wc INTO DATA(ls_wc)
-        WITH TABLE KEY matnr = ls_comp-fg-matnr werks = ls_comp-fg-werks.
-      IF sy-subrc = 0.
-        <out>-arbpl = ls_wc-arbpl.
-      ENDIF.
-
-      READ TABLE lt_prt INTO DATA(ls_prt)
-        WITH TABLE KEY matnr = ls_comp-fg-matnr werks = ls_comp-fg-werks.
-      IF sy-subrc = 0.
-        <out>-equnr = ls_prt-equnr.
-      ENDIF.
+      " Min/Max Stock Level, Net Weight and Work Center / PRT are no
+      " longer part of this ALV - see the form header.
+*      READ TABLE lt_minmax INTO DATA(ls_mm)
+*        WITH TABLE KEY matnr = ls_comp-idnrk werks = ls_comp-fg-werks.
+*      IF sy-subrc = 0.
+*        <out>-min_stock = ls_mm-min_stock.
+*        <out>-max_stock = ls_mm-max_stock.
+*      ENDIF.
+*
+*      READ TABLE lt_weight INTO DATA(ls_w)
+*        WITH TABLE KEY matnr = ls_comp-idnrk.
+*      IF sy-subrc = 0.
+*        <out>-net_weight = ls_w-net_weight.
+*      ENDIF.
+*
+*      READ TABLE lt_wc INTO DATA(ls_wc)
+*        WITH TABLE KEY matnr = ls_comp-fg-matnr werks = ls_comp-fg-werks.
+*      IF sy-subrc = 0.
+*        <out>-arbpl = ls_wc-arbpl.
+*      ENDIF.
+*
+*      READ TABLE lt_prt INTO DATA(ls_prt)
+*        WITH TABLE KEY matnr = ls_comp-fg-matnr werks = ls_comp-fg-werks.
+*      IF sy-subrc = 0.
+*        <out>-equnr = ls_prt-equnr.
+*      ENDIF.
 
     ENDLOOP.
   ENDIF.
@@ -1193,11 +1245,17 @@ FORM move_fg_to_out USING    iu_fg  TYPE ty_fg
   cs_out-net_sto    = iu_fg-net_sto.
   cs_out-deficit_fg = iu_fg-deficit_fg.
 
-  " FG-only columns. In BOM Component Details mode FILL_FG_EXTRA_DATA is
-  " not run, so FG_NETWT/FG_ARBPL/FG_PRT stay initial and the columns are
-  " hidden anyway - the BOM ALV is unaffected either way.
+  " FG stock split - displayed in BOTH modes (in BOM Component Details
+  " mode it is the "FG Stock" half of the stock breakup). Filled by
+  " FILL_FG_STOCK, which runs in both modes.
   cs_out-fg_unres   = iu_fg-fg_unres.
   cs_out-fg_qual    = iu_fg-fg_qual.
+
+  " FG-only columns. In BOM Component Details mode FILL_FG_EXTRA_DATA is
+  " not run, so these stay initial and the columns are hidden anyway -
+  " the BOM ALV is unaffected either way.
+  cs_out-fg_min     = iu_fg-fg_min.
+  cs_out-fg_max     = iu_fg-fg_max.
   cs_out-fg_netwt   = iu_fg-fg_netwt.
   cs_out-fg_arbpl   = iu_fg-fg_arbpl.
   cs_out-fg_prt     = iu_fg-fg_prt.
@@ -1425,6 +1483,10 @@ FORM display_alv.
   DATA(lo_cols) = lo_alv->get_columns( ).
   lo_cols->set_optimize( abap_true ).
 
+  " Register the row-colour table. SALV consumes T_COLOR for colouring
+  " and does not render it as a column, so no explicit hide is needed.
+  lo_cols->set_color_column( 'T_COLOR' ).
+
   " ---- Shared FG-level columns ------------------------------------
   " A SHORT text is supplied for every quantity column. Without one,
   " SET_OPTIMIZE lets SALV fall back to the data element's own short
@@ -1450,11 +1512,27 @@ FORM display_alv.
   PERFORM set_col USING lo_cols 'DEFICIT_FG'
                         'FGDef/Sur' 'FG Def/Surplus Qty' 'FG Deficit / Surplus Qty'.
 
+  " ---- FG stock split (shown in BOTH modes) -----------------------
+  " In BOM Component Details mode these are the "FG Stock" half of the
+  " stock breakup and are prefixed "FG " so they cannot be confused with
+  " the component stock columns alongside them.
+  IF p_fgdef = abap_true.
+    PERFORM set_col USING lo_cols 'FG_UNRES'
+                          'Unrest.Stk' 'Unrestricted Stock' 'Unrestricted Stock'.
+    PERFORM set_col USING lo_cols 'FG_QUAL'
+                          'Qual.Stock' 'Quality Stock' 'Quality Stock'.
+  ELSE.
+    PERFORM set_col USING lo_cols 'FG_UNRES'
+                          'FGUnresStk' 'FG Unrestricted Stk' 'FG Unrestricted Stock'.
+    PERFORM set_col USING lo_cols 'FG_QUAL'
+                          'FGQualStk' 'FG Quality Stock' 'FG Quality Stock'.
+  ENDIF.
+
   " ---- FG-only columns (FG Deficit mode) --------------------------
-  PERFORM set_col USING lo_cols 'FG_UNRES'
-                        'Unrest.Stk' 'Unrestricted Stock' 'Unrestricted Stock'.
-  PERFORM set_col USING lo_cols 'FG_QUAL'
-                        'Qual.Stock' 'Quality Stock' 'Quality Stock'.
+  PERFORM set_col USING lo_cols 'FG_MIN'
+                        'Min Stock' 'Min Stock Level' 'Min Stock Level'.
+  PERFORM set_col USING lo_cols 'FG_MAX'
+                        'Max Stock' 'Max Stock Level' 'Max Stock Level'.
   PERFORM set_col USING lo_cols 'FG_NETWT'
                         'Net Weight' 'Net Weight' 'Net Weight'.
   PERFORM set_col USING lo_cols 'FG_ARBPL'
@@ -1463,65 +1541,93 @@ FORM display_alv.
                         'PRT' 'PRT' 'PRT'.
 
   " ---- Component columns (BOM Component Details mode) -------------
-  " Headers deliberately unchanged; SPACE as short text keeps the
-  " previous behaviour for this ALV exactly as it was.
+  " Existing headers deliberately unchanged; SPACE as short text keeps
+  " the previous behaviour for those columns exactly as it was.
   PERFORM set_col USING lo_cols 'IDNRK'        space 'BOM Component'  'BOM Component'.
   PERFORM set_col USING lo_cols 'QTY_BOM'      space 'QTY as per BOM' 'QTY as per BOM'.
   PERFORM set_col USING lo_cols 'RMPM_STOCK'   space 'RM/PM Stock'    'RM/PM Stock'.
   PERFORM set_col USING lo_cols 'RMPM_DEFICIT' space 'RM/PM Deficit'  'RM/PM Deficit'.
+
+  " New component stock breakup - named so the FG / component split is
+  " unambiguous when both appear side by side.
+  PERFORM set_col USING lo_cols 'RMPM_UNRES'
+                        'CompUnrStk' 'Comp Unrestr. Stock' 'BOM Component Unrestricted Stock'.
+  PERFORM set_col USING lo_cols 'RMPM_QUAL'
+                        'CompQuaStk' 'Comp Quality Stock' 'BOM Component Quality Stock'.
+
+  " Headers for the withdrawn component columns are retained so that
+  " re-enabling them is a one-line change (see HIDE_COLS calls below).
   PERFORM set_col USING lo_cols 'MIN_STOCK'    space 'Min Stock Level' 'Min Stock Level'.
   PERFORM set_col USING lo_cols 'MAX_STOCK'    space 'Max Stock Level' 'Max Stock Level'.
   PERFORM set_col USING lo_cols 'NET_WEIGHT'   space 'Net Weight'     'Net Weight'.
   PERFORM set_col USING lo_cols 'ARBPL'        space 'Work Center'    'Work Center'.
   PERFORM set_col USING lo_cols 'EQUNR'        space 'PRT'            'PRT'.
 
+  " ---- Per-mode visibility ----------------------------------------
+  DATA lt_hide TYPE string_table.
+
   IF p_fgdef = abap_true.
-    " FG Deficit mode: FG-level columns only.
-    PERFORM hide_component_columns USING lo_cols.
+    " FG Deficit mode: hide the component block.
+    lt_hide = VALUE #( ( `IDNRK` ) ( `QTY_BOM` ) ( `RMPM_STOCK` )
+                       ( `RMPM_UNRES` ) ( `RMPM_QUAL` ) ( `RMPM_DEFICIT` ) ).
   ELSE.
-    " BOM Component Details mode: hide the FG-only additions so this
-    " ALV keeps exactly the columns it had before this enhancement.
-    PERFORM hide_fg_only_columns USING lo_cols.
+    " BOM Component Details mode: hide the FG-only attributes. FG_UNRES /
+    " FG_QUAL stay visible here - they are the FG half of the breakup.
+    lt_hide = VALUE #( ( `FG_MIN` ) ( `FG_MAX` )
+                       ( `FG_NETWT` ) ( `FG_ARBPL` ) ( `FG_PRT` ) ).
   ENDIF.
+  PERFORM hide_cols USING lo_cols lt_hide.
+
+  " Withdrawn from the BOM Component Details ALV per change request, and
+  " already absent from the FG Deficit ALV - hidden in both modes.
+  lt_hide = VALUE #( ( `MIN_STOCK` ) ( `MAX_STOCK` )
+                     ( `NET_WEIGHT` ) ( `ARBPL` ) ( `EQUNR` ) ).
+  PERFORM hide_cols USING lo_cols lt_hide.
 
   lo_alv->display( ).
 
 ENDFORM.
 
 *&---------------------------------------------------------------------*
-*&      Form  HIDE_FG_ONLY_COLUMNS
+*&      Form  SET_ROW_COLORS
 *&---------------------------------------------------------------------*
-* BOM Component Details mode: hide the columns that were added for the
-* FG Deficit ALV, so that output is unchanged by this enhancement.
+* Highlights every output row whose FG Deficit/Surplus quantity is
+* negative (an actual shortage) in red. Applies to both ALVs, since
+* DEFICIT_FG is an FG-level field present on every row in either mode.
+* Rows with a zero or positive Deficit/Surplus keep the standard ALV
+* formatting - T_COLOR is simply left empty for them.
+*
+* An empty FNAME colours the whole row. The colour table is built once
+* here, in memory, so display performance is unaffected.
 *&---------------------------------------------------------------------*
-FORM hide_fg_only_columns USING io_cols TYPE REF TO cl_salv_columns_table.
+FORM set_row_colors.
 
-  DATA(lt_hide) = VALUE string_table(
-    ( `FG_UNRES` ) ( `FG_QUAL` ) ( `FG_NETWT` ) ( `FG_ARBPL` ) ( `FG_PRT` ) ).
+  DATA ls_scol TYPE lvc_s_scol.
 
-  LOOP AT lt_hide INTO DATA(lv_col).
-    TRY.
-        io_cols->get_column( CONV lvc_fname( lv_col ) )->set_visible( abap_false ).
-      CATCH cx_salv_not_found.
-        "column not present - ignore
-    ENDTRY.
+  CLEAR ls_scol-fname.                       "blank = entire row
+  ls_scol-color-col = gc_color_negative.     "6 = red
+  ls_scol-color-int = gc_color_intensiv.
+  ls_scol-color-inv = gc_color_not_inv.
+
+  LOOP AT gt_out ASSIGNING FIELD-SYMBOL(<out>) WHERE deficit_fg < 0.
+    APPEND ls_scol TO <out>-t_color.
   ENDLOOP.
 
 ENDFORM.
 
 *&---------------------------------------------------------------------*
-*&      Form  HIDE_COMPONENT_COLUMNS
+*&      Form  HIDE_COLS
 *&---------------------------------------------------------------------*
-* FG Deficit mode: hide the RM/PM component-level columns so the ALV
-* contains only FG-level information.
+* Hides the named columns. Replaces the former HIDE_FG_ONLY_COLUMNS and
+* HIDE_COMPONENT_COLUMNS, which performed identical work on different
+* lists - the per-mode lists now live in DISPLAY_ALV, where the rest of
+* the field catalogue is, so column visibility can be read in one place.
+* A column that is not present is silently ignored.
 *&---------------------------------------------------------------------*
-FORM hide_component_columns USING io_cols TYPE REF TO cl_salv_columns_table.
+FORM hide_cols USING io_cols TYPE REF TO cl_salv_columns_table
+                     it_cols TYPE string_table.
 
-  DATA(lt_hide) = VALUE string_table(
-    ( `IDNRK` ) ( `QTY_BOM` ) ( `RMPM_STOCK` ) ( `RMPM_DEFICIT` )
-    ( `MIN_STOCK` ) ( `MAX_STOCK` ) ( `NET_WEIGHT` ) ( `ARBPL` ) ( `EQUNR` ) ).
-
-  LOOP AT lt_hide INTO DATA(lv_col).
+  LOOP AT it_cols INTO DATA(lv_col).
     TRY.
         io_cols->get_column( CONV lvc_fname( lv_col ) )->set_visible( abap_false ).
       CATCH cx_salv_not_found.
